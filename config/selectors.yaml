@@ -1,0 +1,19 @@
+# 问卷星页面元素选择器配置
+question_page:
+  # 题目容器
+  question_container: "div.field"
+  # 提交按钮
+  submit_button: "input#submit_button, button#submit_button"
+  # 单选题
+  single_choice:
+    option: "input[type='radio']"
+    alternative: "div.radio-div" # 备用选择器
+  # 多选题
+  multiple_choice:
+    option: "input[type='checkbox']"
+    alternative: "div.checkbox-div"
+  # 填空题
+  fill_blank:
+    input: "input[type='text'], textarea"
+  # 验证码弹窗检测（如果出现此元素，则暂停）
+  captcha_detection: "div#divCaptcha, div.geetest_panel"
