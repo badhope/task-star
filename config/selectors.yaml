@@ -3,17 +3,22 @@ question_page:
   # 题目容器
   question_container: "div.field"
   # 提交按钮
-  submit_button: "input#submit_button, button#submit_button"
+  submit_button: "input#submit_button, button#submit_button, #ctlNext"
   # 单选题
   single_choice:
     option: "input[type='radio']"
-    alternative: "div.radio-div" # 备用选择器
+    alternative: "div.radio-div, div.ui-radio"
   # 多选题
   multiple_choice:
     option: "input[type='checkbox']"
-    alternative: "div.checkbox-div"
+    alternative: "div.checkbox-div, div.ui-checkbox"
   # 填空题
   fill_blank:
-    input: "input[type='text'], textarea"
+    input: "input[type='text'], textarea, input.u-input"
+  # 下拉选择题
+  dropdown:
+    select: "select"
   # 验证码弹窗检测（如果出现此元素，则暂停）
-  captcha_detection: "div#divCaptcha, div.geetest_panel"
+  captcha_detection: "div#divCaptcha, div.geetest_panel, #alertdiv"
+  # 提交成功指示器
+  success_indicator: "div.success, div#success_page, .endtext"

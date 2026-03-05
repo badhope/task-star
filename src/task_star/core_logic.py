@@ -1,27 +1,34 @@
 import time
 import random
 import threading
+from typing import Optional, Callable, Dict, Any
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 
 from .config import config
 from .browser import BrowserManager
 from .strategies.single import SingleChoiceStrategy
 from .strategies.multiple import MultipleChoiceStrategy
 from .strategies.blank import FillBlankStrategy
+from .strategies.dropdown import DropdownStrategy
 from .exceptions import *
-from .utils import logger # 假设你配置了日志模块
+from .utils import logger
+
 
 class QuestionnaireFiller:
-    def __init__(self, status_callback=None, log_callback=None, stop_event=None):
+    def __init__(self, status_callback: Optional[Callable] = None, 
+                 log_callback: Optional[Callable] = None, 
+                 progress_callback: Optional[Callable] = None,
+                 stop_event: Optional[threading.Event] = None):
         """
         初始化问卷填写器
 
         参数说明:
             status_callback: 用于更新UI状态的回调函数 (可选)
             log_callback: 用于在UI显示日志的回调函数 (可选)
+            progress_callback: 用于更新进度条的回调函数，参数为(current, total) (可选)
             stop_event: threading.Event对象，用于接收停止信号 (可选)
         """
         if config is None:
@@ -30,47 +37,102 @@ class QuestionnaireFiller:
         self.config = config
         self.status_callback = status_callback
         self.log_callback = log_callback
-        self.stop_event = stop_event  # 从外部传入的停止事件
+        self.progress_callback = progress_callback
+        self.stop_event = stop_event
         self.driver = None
-        # 如果外部没有传入 stop_event，则创建一个内部的事件对象
+        self.browser_manager = None
+        
         if self.stop_event is None:
             self._internal_stop_event = threading.Event()
             self.stop_event = self._internal_stop_event
         
-        # 加载选择器配置
+        self._captcha_wait_event = threading.Event()
+        self._captcha_wait_event.set()
+        
         self.selectors = self._load_selectors()
         
-        # 初始化策略
         self.strategies = {
             'single': SingleChoiceStrategy(),
             'multiple': MultipleChoiceStrategy(
                 min_select=self.config.strategy.get('multi_choice', {}).get('min_select', 2),
                 max_select=self.config.strategy.get('multi_choice', {}).get('max_select', 3)
             ),
-            'blank': FillBlankStrategy(self.config.strategy.get('fill_blanks', {}))
+            'blank': FillBlankStrategy(self.config.strategy.get('fill_blanks', {})),
+            'dropdown': DropdownStrategy()
         }
+        
+        self._success_count = 0
+        self._fail_count = 0
+        self._retry_count = self.config.general.get('retry_count', 3)
 
-    def _load_selectors(self):
+    def _load_selectors(self) -> Dict[str, Any]:
         """加载选择器配置"""
-        # 这里简化处理，实际应从selectors.yaml读取
-        # 可以在config.py中统一加载
         from pathlib import Path
         import yaml
         sel_path = Path(__file__).parent.parent.parent / "config" / "selectors.yaml"
         if not sel_path.exists():
-            raise ConfigError("selectors.yaml 文件缺失")
-        with open(sel_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+            logger.warning("selectors.yaml 文件缺失，使用默认选择器")
+            return self._get_default_selectors()
+        try:
+            with open(sel_path, 'r', encoding='utf-8') as f:
+                selectors = yaml.safe_load(f)
+                return selectors if selectors else self._get_default_selectors()
+        except Exception as e:
+            logger.error(f"加载选择器配置失败: {e}")
+            return self._get_default_selectors()
+    
+    def _get_default_selectors(self) -> Dict[str, Any]:
+        """获取默认选择器配置"""
+        return {
+            'question_page': {
+                'question_container': "div.field",
+                'submit_button': "input#submit_button, button#submit_button",
+                'single_choice': {
+                    'option': "input[type='radio']",
+                    'alternative': "div.radio-div"
+                },
+                'multiple_choice': {
+                    'option': "input[type='checkbox']",
+                    'alternative': "div.checkbox-div"
+                },
+                'fill_blank': {
+                    'input': "input[type='text'], textarea"
+                },
+                'dropdown': {
+                    'select': "select"
+                },
+                'captcha_detection': "div#divCaptcha, div.geetest_panel",
+                'success_indicator': "div.success, div#success_page"
+            }
+        }
 
-    def _update_status(self, msg):
+    def _update_status(self, msg: str):
+        """更新状态"""
         if self.status_callback:
-            self.status_callback(msg)
+            try:
+                self.status_callback(msg)
+            except Exception as e:
+                logger.error(f"状态回调执行失败: {e}")
         logger.info(msg)
 
-    def _log(self, msg):
+    def _log(self, msg: str, level: str = "INFO"):
+        """记录日志"""
         if self.log_callback:
-            self.log_callback(msg)
-        logger.info(msg)
+            try:
+                self.log_callback(msg)
+            except Exception as e:
+                logger.error(f"日志回调执行失败: {e}")
+        
+        log_level = getattr(logger, level.lower(), logger.info)
+        log_level(msg)
+
+    def _update_progress(self, current: int, total: int):
+        """更新进度"""
+        if self.progress_callback:
+            try:
+                self.progress_callback(current, total)
+            except Exception as e:
+                logger.error(f"进度回调执行失败: {e}")
 
     def run(self):
         """
@@ -79,120 +141,200 @@ class QuestionnaireFiller:
         """
         try:
             self._update_status("正在初始化浏览器...")
-            # 根据配置创建浏览器管理器，headless参数控制是否显示浏览器窗口
-            browser_manager = BrowserManager(headless=self.config.general.get('headless', False))
-            self.driver = browser_manager.create_driver()
+            
+            headless = self.config.general.get('headless', False)
+            proxy = self.config.general.get('proxy', None)
+            self.browser_manager = BrowserManager(headless=headless, proxy=proxy)
+            self.driver = self.browser_manager.create_driver()
 
-            # 从配置文件中读取问卷链接和填写次数
             url = self.config.general['questionnaire_url']
             fill_times = self.config.general['fill_times']
 
             self._log(f"任务开始: 目标 {fill_times} 份")
+            self._success_count = 0
+            self._fail_count = 0
 
-            success_count = 0
             for i in range(fill_times):
-                # 检查是否接收到停止信号
+                if self.stop_event.is_set():
+                    self._log("用户中止任务")
+                    break
+                
+                self._captcha_wait_event.wait()
+                
                 if self.stop_event.is_set():
                     self._log("用户中止任务")
                     break
 
                 self._update_status(f"正在处理第 {i+1}/{fill_times} 份...")
-                try:
-                    self._process_one_questionnaire(i+1)
-                    success_count += 1
-                    self._log(f"第 {i+1} 份完成")
-                except CaptchaEncounteredError:
-                    # 遇到验证码时的处理逻辑
-                    self._log("⚠️ 检测到验证码！请手动完成验证，程序将暂停。")
-                    # 这里可以实现一个等待逻辑，比如弹窗提示用户点击继续
-                    # 暂时简单处理：暂停并等待用户在UI点击"继续"
-                    # 实际项目中可以结合 threading.Event.wait()
-                    self._update_status("等待验证码处理...")
-                    time.sleep(15)  # 给用户15秒时间处理
-                    self._log("继续执行...")
-                except Exception as e:
-                    # 捕获其他异常，记录日志但继续执行后续任务
-                    self._log(f"❌ 第 {i+1} 份失败: {str(e)}")
-                    # 失败重试逻辑可以加在这里
+                self._update_progress(i, fill_times)
+                
+                success = False
+                for retry in range(self._retry_count):
+                    if self.stop_event.is_set():
+                        break
+                    try:
+                        self._process_one_questionnaire(i+1)
+                        success = True
+                        break
+                    except CaptchaEncounteredError:
+                        self._log("⚠️ 检测到验证码！请手动完成验证后点击'继续'按钮")
+                        self._update_status("等待验证码处理...")
+                        self._captcha_wait_event.clear()
+                        self._captcha_wait_event.wait()
+                        if retry < self._retry_count - 1:
+                            self._log("重试中...")
+                            continue
+                        else:
+                            raise
+                    except PageLoadError as e:
+                        self._log(f"❌ 页面加载失败: {e}", "ERROR")
+                        if retry < self._retry_count - 1:
+                            wait_time = (retry + 1) * 5
+                            self._log(f"等待 {wait_time} 秒后重试...")
+                            time.sleep(wait_time)
+                        continue
+                    except WebDriverException as e:
+                        self._log(f"❌ 浏览器错误: {e}", "ERROR")
+                        if retry < self._retry_count - 1:
+                            self._log("尝试重新初始化浏览器...")
+                            try:
+                                if self.driver:
+                                    self.driver.quit()
+                                self.driver = self.browser_manager.create_driver()
+                            except Exception:
+                                pass
+                        continue
+                    except Exception as e:
+                        self._log(f"❌ 第 {i+1} 份失败: {str(e)}", "ERROR")
+                        if retry < self._retry_count - 1:
+                            time.sleep(2)
+                            continue
 
-                # 随机间隔，模拟真人行为，避免被识别为机器
-                interval = self.config.general.get('interval_seconds', 3)
-                jitter = random.uniform(0, 2)  # 增加随机抖动，让提交时间更自然
-                time.sleep(interval + jitter)
+                if success:
+                    self._success_count += 1
+                    self._log(f"✅ 第 {i+1} 份完成")
+                else:
+                    self._fail_count += 1
+                    self._log(f"❌ 第 {i+1} 份失败（已重试 {self._retry_count} 次）", "ERROR")
 
-            self._update_status(f"任务结束: 成功 {success_count}/{fill_times}")
+                if i < fill_times - 1 and not self.stop_event.is_set():
+                    interval = self.config.general.get('interval_seconds', 3)
+                    jitter = random.uniform(0, 2)
+                    actual_interval = interval + jitter
+                    self._log(f"等待 {actual_interval:.1f} 秒...")
+                    time.sleep(actual_interval)
 
+            self._update_progress(fill_times, fill_times)
+            self._update_status(f"任务结束: 成功 {self._success_count}/{fill_times}, 失败 {self._fail_count}")
+            self._log(f"📊 任务统计: 成功 {self._success_count} 份, 失败 {self._fail_count} 份")
+
+        except BrowserInitError as e:
+            self._log(f"❌ 浏览器初始化失败: {e}", "ERROR")
+            self._update_status("浏览器初始化失败")
         except Exception as e:
-            self._log(f"严重错误: {str(e)}")
+            self._log(f"❌ 严重错误: {str(e)}", "ERROR")
             self._update_status("发生错误，任务停止")
         finally:
-            # 无论成功或失败，都要关闭浏览器
-            if self.driver:
-                self.driver.quit()
+            self._cleanup()
 
-    def _process_one_questionnaire(self, index):
+    def _cleanup(self):
+        """清理资源"""
+        if self.driver:
+            try:
+                self.driver.quit()
+                self._log("浏览器已关闭")
+            except Exception as e:
+                logger.error(f"关闭浏览器时出错: {e}")
+            finally:
+                self.driver = None
+
+    def _process_one_questionnaire(self, index: int):
         """
         处理单份问卷的完整流程
 
         参数说明:
             index: 当前是第几份问卷（用于日志显示）
         """
-        # 打开问卷页面
-        self.driver.get(self.config.general['questionnaire_url'])
+        url = self.config.general['questionnaire_url']
+        self.driver.get(url)
 
-        # 等待页面加载完成，最多等待15秒
+        page_timeout = self.config.general.get('page_timeout', 30)
         try:
-            WebDriverWait(self.driver, 15).until(
+            WebDriverWait(self.driver, page_timeout).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, self.selectors['question_page']['question_container']))
             )
         except TimeoutException:
-            raise PageLoadError("页面加载超时，请检查网络或链接")
+            raise PageLoadError(f"页面加载超时（{page_timeout}秒），请检查网络或链接")
 
-        # 检测是否出现验证码
         if self._check_captcha():
             raise CaptchaEncounteredError()
 
-        # 获取页面中所有的题目元素
         questions = self.driver.find_elements(By.CSS_SELECTOR, self.selectors['question_page']['question_container'])
+        
+        if not questions:
+            self._log("⚠️ 未检测到任何题目，可能页面结构已变化", "WARNING")
 
-        # 遍历每一道题目
         for q_idx, q_element in enumerate(questions):
-            # 检查是否接收到停止信号
             if self.stop_event.is_set():
                 return
 
-            # 滚动到当前题目，确保可见，模拟人类浏览行为
-            self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", q_element)
-            time.sleep(0.5)  # 稍微等待滚动动画完成
+            try:
+                self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", q_element)
+                time.sleep(random.uniform(0.3, 0.8))
+            except Exception:
+                pass
 
-            # 识别题目类型并获取题号
             q_type = self._identify_question_type(q_element)
-            q_num = q_idx + 1  # 题号从1开始
+            q_num = q_idx + 1
 
             try:
-                # 根据题目类型调用相应的策略进行答题
                 if q_type == 'single':
-                    # 单选题策略
                     self.strategies['single'].execute(q_element, selectors=self.selectors)
                 elif q_type == 'multiple':
-                    # 多选题策略
                     self.strategies['multiple'].execute(q_element, selectors=self.selectors)
                 elif q_type == 'blank':
-                    # 填空题策略，需要传入题号来获取对应的答案池
                     self.strategies['blank'].execute(q_element, question_number=q_num, selectors=self.selectors)
+                elif q_type == 'dropdown':
+                    self.strategies['dropdown'].execute(q_element, selectors=self.selectors)
                 else:
-                    self._log(f"题目 {q_num}: 未知题型，跳过")
+                    self._log(f"⚠️ 题目 {q_num}: 未知题型，跳过", "WARNING")
             except Exception as e:
-                # 单题出错不影响整体，记录日志继续执行
-                self._log(f"题目 {q_num} 处理出错: {e}")
+                self._log(f"⚠️ 题目 {q_num} 处理出错: {e}", "WARNING")
 
-        # 如果配置了自动提交，则点击提交按钮
         if self.config.general.get('auto_submit', True):
-            submit_btn = self.driver.find_element(By.CSS_SELECTOR, self.selectors['question_page']['submit_button'])
-            submit_btn.click()
-            self._log("已点击提交")
+            self._submit_questionnaire()
 
-    def _check_captcha(self):
+    def _submit_questionnaire(self):
+        """提交问卷并验证"""
+        try:
+            submit_btn = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, self.selectors['question_page']['submit_button']))
+            )
+            submit_btn.click()
+            self._log("已点击提交按钮")
+            
+            time.sleep(2)
+            
+            success_indicator = self.selectors['question_page'].get('success_indicator')
+            if success_indicator:
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, success_indicator))
+                    )
+                    self._log("✅ 提交成功确认")
+                except TimeoutException:
+                    current_url = self.driver.current_url
+                    if 'success' in current_url.lower() or 'complete' in current_url.lower():
+                        self._log("✅ 提交成功（通过URL确认）")
+                    else:
+                        self._log("⚠️ 无法确认提交状态，请手动检查", "WARNING")
+                        
+        except TimeoutException:
+            raise ElementNotFound("提交按钮未找到或不可点击")
+        except Exception as e:
+            raise TaskStarError(f"提交失败: {e}")
+
+    def _check_captcha(self) -> bool:
         """
         检测是否出现验证码
 
@@ -200,19 +342,16 @@ class QuestionnaireFiller:
             True: 检测到验证码
             False: 未检测到验证码
         """
-        # 从配置文件中读取验证码检测选择器
         captcha_sel = self.selectors['question_page'].get('captcha_detection')
         if not captcha_sel:
             return False
         try:
-            # 尝试查找验证码元素
             el = self.driver.find_element(By.CSS_SELECTOR, captcha_sel)
             return el.is_displayed()
         except NoSuchElementException:
-            # 未找到验证码元素，说明没有验证码
             return False
 
-    def _identify_question_type(self, element):
+    def _identify_question_type(self, element) -> str:
         """
         识别题目类型
 
@@ -223,24 +362,24 @@ class QuestionnaireFiller:
             'single': 单选题
             'multiple': 多选题
             'blank': 填空题
+            'dropdown': 下拉选择题
             'unknown': 未知题型
         """
-        # 使用配置文件中的选择器来判断题目类型
         sp = self.selectors['question_page']
 
-        # 检查是否有单选按钮 (input[type='radio'])
         if element.find_elements(By.CSS_SELECTOR, sp['single_choice']['option']):
             return 'single'
 
-        # 检查是否有复选框 (input[type='checkbox'])
         if element.find_elements(By.CSS_SELECTOR, sp['multiple_choice']['option']):
             return 'multiple'
+        
+        dropdown_sel = sp.get('dropdown', {}).get('select', 'select')
+        if element.find_elements(By.CSS_SELECTOR, dropdown_sel):
+            return 'dropdown'
 
-        # 检查是否有文本输入框 (input[type='text'] 或 textarea)
         if element.find_elements(By.CSS_SELECTOR, sp['fill_blank']['input']):
             return 'blank'
 
-        # 未能识别的题型
         return 'unknown'
 
     def stop(self):
@@ -249,3 +388,32 @@ class QuestionnaireFiller:
         设置停止事件标志，让run()方法退出循环
         """
         self.stop_event.set()
+        self._captcha_wait_event.set()
+
+    def resume_after_captcha(self):
+        """
+        在验证码处理后继续执行
+        """
+        self._captcha_wait_event.set()
+        self._log("继续执行...")
+
+    def wait_for_captcha(self, timeout: int = None):
+        """
+        等待验证码处理
+        
+        参数:
+            timeout: 超时时间（秒），None表示无限等待
+        """
+        if timeout:
+            self._captcha_wait_event.wait(timeout=timeout)
+        else:
+            self._captcha_wait_event.wait()
+
+    @property
+    def statistics(self) -> Dict[str, int]:
+        """获取任务统计信息"""
+        return {
+            'success': self._success_count,
+            'fail': self._fail_count,
+            'total': self._success_count + self._fail_count
+        }

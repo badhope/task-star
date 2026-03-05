@@ -1,7 +1,10 @@
 import yaml
 import os
+import re
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+from .utils import logger
+from .exceptions import ConfigError
 
 
 class ConfigLoader:
@@ -13,7 +16,7 @@ class ConfigLoader:
         提供配置项访问的便捷接口
     """
 
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: Optional[str] = None):
         """
         初始化配置加载器
 
@@ -30,20 +33,13 @@ class ConfigLoader:
             - 如果配置格式错误，抛出 yaml.YAMLError
             - 如果缺少必填项，抛出 ValueError
         """
-        # 1. 确定配置文件路径
         if config_path is None:
-            # 如果未指定路径，使用默认路径
-            # 项目根目录/config/config.yaml
-            root_dir = Path(__file__).parent.parent.parent  # 回退三级目录到项目根目录
+            root_dir = Path(__file__).parent.parent.parent
             config_path = root_dir / "config" / "config.yaml"
 
-        # 转换为 Path 对象，便于路径操作
         self.config_path = Path(config_path)
-
-        # 2. 加载配置文件
+        self._raw_config = {}
         self.config = self._load_config()
-
-        # 3. 验证配置文件的完整性
         self._validate_config()
 
     def _load_config(self) -> Dict[str, Any]:
@@ -57,9 +53,8 @@ class ConfigLoader:
             FileNotFoundError: 配置文件不存在
             yaml.YAMLError: YAML 格式错误
         """
-        # 检查配置文件是否存在
         if not self.config_path.exists():
-            raise FileNotFoundError(
+            raise ConfigError(
                 f"配置文件未找到: {self.config_path}\n"
                 f"请按以下步骤操作:\n"
                 f"1. 复制 config/default_config.yaml 文件\n"
@@ -67,10 +62,12 @@ class ConfigLoader:
                 f"3. 根据实际情况修改配置内容"
             )
 
-        # 读取并解析 YAML 文件
-        # 使用 utf-8 编码以支持中文注释和内容
-        with open(self.config_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+        try:
+            with open(self.config_path, 'r', encoding='utf-8') as f:
+                self._raw_config = yaml.safe_load(f) or {}
+                return self._raw_config
+        except yaml.YAMLError as e:
+            raise ConfigError(f"配置文件格式错误: {e}")
 
     def _validate_config(self):
         """
@@ -83,11 +80,10 @@ class ConfigLoader:
                - fill_times: 填写次数
 
         抛出异常:
-            ValueError: 配置项缺失或无效
+            ConfigError: 配置项缺失或无效
         """
-        # 检查 general 部分
         if 'general' not in self.config:
-            raise ValueError(
+            raise ConfigError(
                 "配置文件缺少 'general' 部分\n"
                 "请在配置文件中添加:\n"
                 "general:\n"
@@ -95,22 +91,44 @@ class ConfigLoader:
                 "  fill_times: 10"
             )
 
-        # 检查必填项
         required_general_keys = ['questionnaire_url', 'fill_times']
         for key in required_general_keys:
             if key not in self.config['general']:
-                raise ValueError(
+                raise ConfigError(
                     f"配置项 general.{key} 是必填项\n"
                     "请在配置文件的 general 部分添加该项"
                 )
 
-        # 可选: 验证问卷链接格式（简单验证）
         url = self.config['general'].get('questionnaire_url', '')
         if not url or not (url.startswith('http://') or url.startswith('https://')):
-            raise ValueError(
+            raise ConfigError(
                 f"问卷链接格式不正确: {url}\n"
                 "请确保链接以 http:// 或 https:// 开头"
             )
+
+        fill_times = self.config['general'].get('fill_times', 0)
+        if not isinstance(fill_times, int) or fill_times < 1:
+            raise ConfigError(
+                f"填写次数必须为正整数，当前值: {fill_times}"
+            )
+
+        interval = self.config['general'].get('interval_seconds', 3)
+        if not isinstance(interval, (int, float)) or interval < 0:
+            raise ConfigError(
+                f"提交间隔必须为非负数，当前值: {interval}"
+            )
+
+        strategy = self.config.get('strategy', {})
+        if 'multi_choice' in strategy:
+            mc = strategy['multi_choice']
+            min_sel = mc.get('min_select', 2)
+            max_sel = mc.get('max_select', 3)
+            if min_sel > max_sel and max_sel != -1:
+                raise ConfigError(
+                    f"多选题配置错误: min_select({min_sel}) 不能大于 max_select({max_sel})"
+                )
+
+        logger.info("配置文件验证通过")
 
     @property
     def general(self) -> Dict[str, Any]:
@@ -140,40 +158,139 @@ class ConfigLoader:
         """
         return self.config.get('strategy', {})
 
-    @classmethod
-    def reload(cls):
+    def get(self, key: str, default: Any = None) -> Any:
         """
-        重新加载全局配置
+        获取配置项
 
-        使用场景:
-            - 修改了配置文件后，需要在不重启程序的情况下重新加载
-            - 通过 UI 界面修改配置后，立即生效
+        参数:
+            key: 配置键，支持点号分隔的嵌套键，如 'general.fill_times'
+            default: 默认值
 
-        注意事项:
-            - 此方法会重新读取 config.yaml 文件
-            - 重新加载时会进行完整的验证
-            - 如果重新加载失败，会保留之前的配置
+        返回:
+            配置值或默认值
         """
-        global config  # 引用全局配置对象
+        keys = key.split('.')
+        value = self.config
+        for k in keys:
+            if isinstance(value, dict) and k in value:
+                value = value[k]
+            else:
+                return default
+        return value
+
+    def set(self, key: str, value: Any):
+        """
+        设置配置项
+
+        参数:
+            key: 配置键，支持点号分隔的嵌套键
+            value: 配置值
+        """
+        keys = key.split('.')
+        config = self.config
+        for k in keys[:-1]:
+            if k not in config:
+                config[k] = {}
+            config = config[k]
+        config[keys[-1]] = value
+
+    def save(self, path: Optional[str] = None):
+        """
+        保存配置到文件
+
+        参数:
+            path: 保存路径，默认为当前配置文件路径
+        """
+        save_path = Path(path) if path else self.config_path
         try:
-            # 创建新的配置加载器实例
-            new_config = ConfigLoader()
-            # 更新全局配置
-            config = new_config
-            print("配置重新加载成功")
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(save_path, 'w', encoding='utf-8') as f:
+                yaml.dump(self.config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+            logger.info(f"配置已保存到: {save_path}")
         except Exception as e:
-            print(f"配置重新加载失败: {e}")
+            raise ConfigError(f"保存配置失败: {e}")
+
+    def reload(self):
+        """
+        重新加载配置文件
+        """
+        self.config = self._load_config()
+        self._validate_config()
+        logger.info("配置重新加载成功")
+
+    @classmethod
+    def create_default(cls, path: str) -> 'ConfigLoader':
+        """
+        创建默认配置文件
+
+        参数:
+            path: 配置文件路径
+
+        返回:
+            ConfigLoader 实例
+        """
+        default_config = {
+            'general': {
+                'questionnaire_url': 'https://www.wjx.cn/jq/12345678.aspx',
+                'fill_times': 5,
+                'auto_submit': True,
+                'interval_seconds': 5,
+                'headless': False,
+                'retry_count': 3,
+                'page_timeout': 30
+            },
+            'strategy': {
+                'single_choice': 'random',
+                'multi_choice': {
+                    'min_select': 2,
+                    'max_select': 3
+                },
+                'fill_blanks': {
+                    1: ['张三', '李四', '王五'],
+                    2: ['计算机科学与技术', '软件工程', '人工智能']
+                }
+            }
+        }
+        
+        config_path = Path(path)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(config_path, 'w', encoding='utf-8') as f:
+            yaml.dump(default_config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        
+        logger.info(f"默认配置文件已创建: {path}")
+        return cls(path)
+
+    def __repr__(self) -> str:
+        return f"ConfigLoader(path={self.config_path})"
 
 
-# 创建全局配置对象，方便其他模块导入使用
-# 其他模块可以通过 from task_star.config import config 来访问配置
-config = None  # 类型: Optional[ConfigLoader]
+def reload_global_config() -> Optional[ConfigLoader]:
+    """
+    重新加载全局配置
+
+    返回值:
+        新的配置对象，如果加载失败返回 None
+    """
+    global config
+    try:
+        new_config = ConfigLoader()
+        config = new_config
+        logger.info("全局配置重新加载成功")
+        return new_config
+    except Exception as e:
+        logger.error(f"全局配置重新加载失败: {e}")
+        return None
+
+
+config: Optional[ConfigLoader] = None
 
 try:
-    # 尝试加载配置
     config = ConfigLoader()
+except ConfigError as e:
+    logger.error(f"配置加载失败: {e}")
+    logger.warning("请检查 config/config.yaml 文件是否存在且格式正确")
+    config = None
 except Exception as e:
-    # 如果加载失败，输出错误信息并将 config 设为 None
-    print(f"配置加载失败: {e}")
-    print("提示: 请检查 config/config.yaml 文件是否存在且格式正确")
+    logger.error(f"配置加载时发生未知错误: {e}")
     config = None

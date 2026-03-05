@@ -16,6 +16,15 @@ general:
   
   # 浏览器运行模式 (true: 后台运行; false: 显示浏览器窗口)
   headless: false
+  
+  # 失败重试次数
+  retry_count: 3
+  
+  # 页面加载超时时间（秒）
+  page_timeout: 30
+  
+  # 代理服务器（可选，格式: host:port）
+  # proxy: "127.0.0.1:7890"
 
 # 答题策略配置
 strategy:
