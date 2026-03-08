@@ -1,9 +1,4 @@
 # Task-Star 依赖包列表
-# 自动生成时间: 2026-03-03
-# 
-# 说明: 
-#   - >= 表示最低版本要求
-#   - 使用 pip install -r requirements.txt 安装所有依赖
 
 # Web 自动化框架
 selenium>=4.15.0
@@ -13,13 +8,3 @@ webdriver-manager>=4.0.1
 
 # YAML 配置文件解析
 pyyaml>=6.0
-
-# 现代 GUI 框架
-customtkinter>=5.2.1
-
-# 图像处理库
-pillow>=10.0.0
-
-# (可选) 开发依赖
-# pytest>=7.0.0
-# black>=23.0.0

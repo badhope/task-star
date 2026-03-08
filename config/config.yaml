@@ -2,11 +2,11 @@
 # 复制自 default_config.yaml，请根据实际情况修改
 
 general:
-  # 问卷链接（必填）
-  questionnaire_url: "https://www.wjx.cn/jq/12345678.aspx"
+  # 问卷链接（必填）- AI 驱动智能招聘与人才画像影响因素调查问卷
+  questionnaire_url: "https://v.wjx.cn/vm/w7MiF02.aspx#"
   
   # 填写次数（必填）
-  fill_times: 5
+  fill_times: 100
   
   # 是否自动提交 (true: 提交; false: 仅填写不提交，用于调试)
   auto_submit: true
@@ -23,7 +23,7 @@ general:
   # 页面加载超时时间（秒）
   page_timeout: 30
   
-  # 代理服务器（可选，格式: host:port）
+  # 代理服务器（可选，格式：host:port）
   # proxy: "127.0.0.1:7890"
 
 # 答题策略配置
@@ -38,9 +38,8 @@ strategy:
     # 最多选择项数 (设为 -1 表示不限制，即选择所有选项)
     max_select: 3
   
-  # 填空题策略：按题号配置答案池
+  # 填空题的策略：按题号配置答案池
   # 程序会从列表中随机选择一个答案填入
   # 键为题号（从 1 开始），值为答案列表
   fill_blanks:
-    1: ["张三", "李四", "王五"]
-    2: ["计算机科学与技术", "软件工程", "人工智能"]
+    9: ["AI 招聘提高了效率", "希望加强算法公平性", "需要完善相关法规", "建议加强人机协同", "技术还需进一步成熟"]
